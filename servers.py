@@ -1,10 +1,14 @@
 """Four separate MCP servers (streamable HTTP), one process each, sharing state via SQLite.
-    python servers.py consent|undo|ledger|actions      (app.py starts all four)"""
+    python servers.py consent|undo|ledger|actions|gmail|calendar      (app.py starts all four)"""
 import sys
-from mcp.server.fastmcp import FastMCP
-import core
+from pydantic import Field, create_model
+from mcp.server.fastmcp import Context, FastMCP
+import core, google_data
 
-PORTS = {"consent": 8765, "undo": 8766, "ledger": 8767, "actions": 8768}
+PORTS = {"consent": 8765, "undo": 8766, "ledger": 8767, "actions": 8768, "gmail": 8769, "calendar": 8770}
+
+def _slot(day, pref):
+    return google_data.suggest_slot(day, pref, core.busy_hours(google_data._next(day).isoformat()))
 
 def build(name):
     m = FastMCP(f"proxy-{name}", host="127.0.0.1", port=PORTS[name])
@@ -29,6 +33,26 @@ def build(name):
         @m.resource("ledger://{requester}/today")
         def ledger(requester: str) -> str:
             return core.ledger_text()
+    elif name == "gmail":
+        @m.tool()
+        def find_bill(biller: str) -> dict:
+            """Read-only: latest bill amount for a biller from the requester's Gmail."""
+            return google_data.find_bill(biller)
+    elif name == "calendar":
+        @m.tool()
+        def suggest_slot(day: str, preferred: str = "11:00") -> dict:
+            """Read-only: first free hour on a weekday, starting at the preferred time."""
+            return _slot(day, preferred)
+        @m.tool()
+        async def choose_appointment(day: str, preferred: str, ctx: Context) -> dict:
+            """Ask the requester which appointment they want (MCP form-mode elicitation) instead of guessing."""
+            a, b = _slot(day, preferred), _slot(day, "16:00")
+            opts = {f"Dr. Rao, {a['slot']}": ("Dr. Rao", a["slot"]), f"Clinic near home, {b['slot']}": ("Clinic near home", b["slot"])}
+            Pick = create_model("Pick", choice=(str, Field(description="Which appointment?", json_schema_extra={"enum": list(opts)})))
+            r = await ctx.elicit(message="Which appointment do you want? / ಯಾವ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಬೇಕು?", schema=Pick)
+            if r.action == "accept" and r.data.choice in opts:       # never trust the reply: must be one of our options
+                p, sl = opts[r.data.choice]; return {"payee": p, "slot": sl, "asked": True}
+            return {"payee": "Dr. Rao", "slot": a["slot"], "asked": False}      # declined or timed out: default, approver still reviews
     else:
         @m.tool()
         def pay_bill(token: str, biller: str, amount: int) -> dict:

@@ -1,11 +1,17 @@
 """Proxy core: consent gate, capability tokens, undo registry, ledger. In-memory for the MVP."""
 import functools, json, os, re, sqlite3, threading, time, uuid
+import google_data, notify
 
 RULES = {"auto_approve_under": 0,            # set e.g. 2000 to pre-approve known billers
          "known_billers": ["BESCOM", "BWSSB"], "max_money_actions_per_day": 5}
-HARD_BLOCK = ["urgent", "gift card", "kyc", "anydesk", "teamviewer", "ತುರ್ತು", "जरूरी"]
+SCAM_EN = [r"urgent(ly)?", r"gift ?cards?", r"kyc", r"anydesk", r"teamviewer", r"quick ?support", r"remote (access|control)",
+           r"otp", r"cvv", r"pin", r"lottery", r"prize", r"arrest", r"customs", r"refund link", r"verify (your )?account"]
+SCAM_LOCAL = ["ತುರ್ತು", "ತಕ್ಷಣ", "ಒಟಿಪಿ", "ಗಿಫ್ಟ್ ಕಾರ್ಡ್", "जरूरी", "तुरंत", "ओटीपी", "लॉटरी", "गिफ्ट कार्ड", "அவசர", "உடனடியாக", "ஓடிபி"]
+def is_scam(text):
+    t = text.lower()
+    return any(re.search(rf"\b{p}\b", t) for p in SCAM_EN) or any(w in t for w in SCAM_LOCAL)
 TTL = 2 * 3600
-ACTIONS, TOKENS, LEDGER, BOOKINGS, REVERSE = {}, {}, [], {}, {}
+ACTIONS, TOKENS, LEDGER, BOOKINGS, REVERSE, EVENTS = {}, {}, [], {}, {}, {}   # EVENTS: calendar entries Proxy added
 DB = os.environ.get("PROXY_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy.db"))
 _tl = threading.local()
 
@@ -21,13 +27,13 @@ def synced(fn):
             con.execute("CREATE TABLE IF NOT EXISTS s(k TEXT PRIMARY KEY, v TEXT)")
             row = con.execute("SELECT v FROM s WHERE k='state'").fetchone()
             st = json.loads(row[0]) if row else {}
-            for d, key in ((ACTIONS, "a"), (TOKENS, "t"), (BOOKINGS, "b"), (REVERSE, "r")):
+            for d, key in ((ACTIONS, "a"), (TOKENS, "t"), (BOOKINGS, "b"), (REVERSE, "r"), (EVENTS, "e")):
                 d.clear(); d.update(st.get(key, {}))
             LEDGER[:] = st.get("l", [])
             try: return fn(*a, **k)
             finally:
                 con.execute("INSERT OR REPLACE INTO s VALUES('state', ?)",
-                            (json.dumps({"a": ACTIONS, "t": TOKENS, "b": BOOKINGS, "r": REVERSE, "l": LEDGER}),))
+                            (json.dumps({"a": ACTIONS, "t": TOKENS, "b": BOOKINGS, "r": REVERSE, "e": EVENTS, "l": LEDGER}),))
                 con.execute("COMMIT")
         finally:
             _tl.in_txn = False; con.close()
@@ -60,13 +66,13 @@ def request_approval(type, payee, amount=0, slot="", text="", requester="Amma", 
     a["what"] = describe(a)
     ACTIONS[a["id"]] = a
     money_today = sum(1 for x in ACTIONS.values() if x["type"] != "book" and x["status"] == "done")
-    if (any(w in text.lower() for w in HARD_BLOCK) or type == "transfer"
+    if (is_scam(text) or type == "transfer"
             or money_today >= RULES["max_money_actions_per_day"]):
-        a["status"] = "blocked"; log("blocked", approver=approver)
+        a["status"] = "blocked"; log("blocked", approver=approver); notify.pending(a, "blocked")
     elif type == "pay_bill" and payee in RULES["known_billers"] and amount <= RULES["auto_approve_under"]:
         approve(a["id"], by="standing rule")
     else:
-        log("pending", approver=approver, what=a["what"])
+        log("pending", approver=approver, what=a["what"]); notify.pending(a)
     return a
 
 def _open(aid):
@@ -111,12 +117,34 @@ def _check(tok, action, payee, amount=0):
 @synced
 def pay_bill(token, biller, amount):
     _check(token, "pay_bill", biller, amount); return {"receipt": "RCPT-" + uuid.uuid4().hex[:6]}
+def _calendar_add(provider, slot):
+    """Add the appointment to the calendar (Google when live, plus our own record). Returns an event id or None."""
+    day, _, hm = slot.partition(" ")
+    date, hour = google_data._next(day).isoformat(), int(hm.split(":")[0])
+    title, gid = f"Appointment: {provider}", None
+    if google_data._live():
+        try: gid = google_data.create_event(title, date, hour)
+        except Exception as ex: print("[calendar] could not add event:", ex, flush=True); return None
+    eid = "ev_" + uuid.uuid4().hex[:6]
+    EVENTS[eid] = dict(id=eid, title=title, date=date, hour=hour, gid=gid)
+    return eid
+
+def _calendar_remove(eid):
+    ev = EVENTS.pop(eid, None)
+    if ev and ev.get("gid"):
+        try: google_data.delete_event(ev["gid"])
+        except Exception as ex: print("[calendar] could not delete event:", ex, flush=True)
+
 @synced
 def book(token, provider, slot):
     _check(token, "book", provider); bid = "BK-" + uuid.uuid4().hex[:5]
-    BOOKINGS[bid] = dict(provider=provider, slot=slot, active=True); return {"booking_id": bid}
+    eid = _calendar_add(provider, slot)
+    BOOKINGS[bid] = dict(provider=provider, slot=slot, active=True, event_id=eid); return {"booking_id": bid, "event_id": eid}
 @synced
-def cancel_booking(bid): BOOKINGS[bid]["active"] = False
+def cancel_booking(bid):
+    BOOKINGS[bid]["active"] = False; _calendar_remove(BOOKINGS[bid].get("event_id"))
+@synced
+def busy_hours(date_iso): return sorted(e["hour"] for e in EVENTS.values() if e["date"] == date_iso)
 
 # ---- undo-mcp ------------------------------------------------------------------
 def _run(a, tok):
@@ -137,26 +165,29 @@ def undo(aid):
     return a
 
 # ---- planner (rule-based stand-in for the LLM) ------------------------------------
-@synced
-def plan(text, requester="Amma"):
+def parse(text):
     t, out = text.lower(), []
     if re.search(r"send|transfer|ಕಳುಹಿಸ|भेज", t):
-        m = re.search(r"(\d[\d,]*)", t); amt = int(m.group(1).replace(",", "")) if m else 0
-        out.append(request_approval("transfer", "unknown number", amt, text=text))
-    if re.search(r"bill|ಬಿಲ್|बिल", t):
-        out.append(request_approval("pay_bill", "BESCOM", 1240, text=text))  # amount would come from Gmail
-    if re.search(r"book|appointment|checkup|ಅಪಾಯಿಂಟ್|अपॉइंटमेंट", t):
-        out.append(request_approval("book", "Dr. Rao", slot="Thursday 11:00", text=text))
+        m = re.search(r"(\d[\d,]*)", t)
+        out.append(dict(type="transfer", payee="unknown number", amount=int(m.group(1).replace(",", "")) if m else 0))
+    if re.search(r"bill|ಬಿಲ್|बिल", t): out.append(dict(type="pay_bill", payee="BESCOM", amount=1240))
+    if not out and re.search(r"\b(pay|give)\b", t) and re.search(r"\d", t):
+        out.append(dict(type="transfer", payee="unknown number", amount=int(re.search(r"(\d[\d,]*)", t).group(1).replace(",", ""))))
+    if re.search(r"book|appointment|checkup|ಅಪಾಯಿಂಟ್|अपॉइंटमेंट", t): out.append(dict(type="book", payee="", slot="Thursday 11:00"))   # empty = ask the requester
     return out
+
+def plan(text, requester="Amma"):
+    return [request_approval(text=text, requester=requester, **{**i, "payee": i.get("payee") or "Dr. Rao"}) for i in parse(text)]
 
 @synced
 def state():
     for aid in list(ACTIONS): _open(aid)
-    return {"actions": sorted(ACTIONS.values(), key=lambda a: a["created"]), "ledger": LEDGER}
+    return {"actions": sorted(ACTIONS.values(), key=lambda a: a["created"]), "ledger": LEDGER,
+            "events": sorted(EVENTS.values(), key=lambda e: (e["date"], e["hour"]))}
 
 @synced
 def reset():
-    for d in (ACTIONS, TOKENS, BOOKINGS, REVERSE): d.clear()
+    for d in (ACTIONS, TOKENS, BOOKINGS, REVERSE, EVENTS): d.clear()
     LEDGER.clear()
 
 @synced
