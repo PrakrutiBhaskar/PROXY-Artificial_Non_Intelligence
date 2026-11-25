@@ -1,12 +1,13 @@
-"""Demo backend + UI.  Run: uvicorn app:app --port 8000   (MCP server starts on :8765/mcp)"""
-import threading
+"""Demo backend + UI.  Run: uvicorn app:app --port 8000   (4 MCP servers start on :8765-8768/mcp)"""
+import atexit, subprocess, sys
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-import core, mcp_server, planner
+import core, planner, servers
 
 app = FastAPI()
-threading.Thread(target=mcp_server.mcp.run, kwargs={"transport": "streamable-http"}, daemon=True).start()
+PROCS = [subprocess.Popen([sys.executable, "servers.py", n]) for n in servers.PORTS]
+atexit.register(lambda: [p.terminate() for p in PROCS])
 
 class Ask(BaseModel): text: str
 class Edit(BaseModel): slot: str | None = None; amount: int | None = None

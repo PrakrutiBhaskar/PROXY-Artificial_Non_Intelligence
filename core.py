@@ -1,11 +1,37 @@
 """Proxy core: consent gate, capability tokens, undo registry, ledger. In-memory for the MVP."""
-import re, time, uuid
+import functools, json, os, re, sqlite3, threading, time, uuid
 
 RULES = {"auto_approve_under": 0,            # set e.g. 2000 to pre-approve known billers
          "known_billers": ["BESCOM", "BWSSB"], "max_money_actions_per_day": 5}
 HARD_BLOCK = ["urgent", "gift card", "kyc", "anydesk", "teamviewer", "ತುರ್ತು", "जरूरी"]
 TTL = 2 * 3600
 ACTIONS, TOKENS, LEDGER, BOOKINGS, REVERSE = {}, {}, [], {}, {}
+DB = os.environ.get("PROXY_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy.db"))
+_tl = threading.local()
+
+def synced(fn):
+    """Load shared state from SQLite, run fn, save it back. Lets several MCP server processes share one state."""
+    @functools.wraps(fn)
+    def wrap(*a, **k):
+        if getattr(_tl, "in_txn", False): return fn(*a, **k)       # nested call: already synced
+        con = sqlite3.connect(DB, timeout=10, isolation_level=None)
+        _tl.in_txn = True
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("CREATE TABLE IF NOT EXISTS s(k TEXT PRIMARY KEY, v TEXT)")
+            row = con.execute("SELECT v FROM s WHERE k='state'").fetchone()
+            st = json.loads(row[0]) if row else {}
+            for d, key in ((ACTIONS, "a"), (TOKENS, "t"), (BOOKINGS, "b"), (REVERSE, "r")):
+                d.clear(); d.update(st.get(key, {}))
+            LEDGER[:] = st.get("l", [])
+            try: return fn(*a, **k)
+            finally:
+                con.execute("INSERT OR REPLACE INTO s VALUES('state', ?)",
+                            (json.dumps({"a": ACTIONS, "t": TOKENS, "b": BOOKINGS, "r": REVERSE, "l": LEDGER}),))
+                con.execute("COMMIT")
+        finally:
+            _tl.in_txn = False; con.close()
+    return wrap
 
 EN = {"paid": "Paid ₹{amount} to {payee}.", "booked": "Appointment booked with {payee}, {slot}.",
       "blocked": "This looks unsafe, so I did not do it. {approver} has been alerted.",
@@ -27,6 +53,7 @@ def describe(a):
     return f"send ₹{a['amount']} to {a['payee']}"
 
 # ---- consent-mcp -------------------------------------------------------------
+@synced
 def request_approval(type, payee, amount=0, slot="", text="", requester="Amma", approver="Pooja"):
     a = dict(id=uuid.uuid4().hex[:6], type=type, payee=payee, amount=amount, slot=slot,
              requester=requester, approver=approver, status="pending", created=time.time())
@@ -48,6 +75,7 @@ def _open(aid):
         a["status"] = "expired"; log("expired", approver=a["approver"], what=a["what"])
     return a
 
+@synced
 def approve(aid, by="Pooja", slot=None, amount=None):
     a = _open(aid)
     if a["status"] != "pending": raise ValueError(f"action is {a['status']}")
@@ -62,11 +90,13 @@ def approve(aid, by="Pooja", slot=None, amount=None):
     _run(a, tok)
     return a
 
+@synced
 def reject(aid):
     a = _open(aid)
     if a["status"] == "pending": a["status"] = "rejected"; log("rejected", approver=a["approver"], what=a["what"])
     return a
 
+@synced
 def revoke(tok): TOKENS.pop(tok, None)
 
 def _check(tok, action, payee, amount=0):
@@ -78,11 +108,14 @@ def _check(tok, action, payee, amount=0):
     t["uses"] -= 1
 
 # ---- mock action servers (token-gated) -----------------------------------------
+@synced
 def pay_bill(token, biller, amount):
     _check(token, "pay_bill", biller, amount); return {"receipt": "RCPT-" + uuid.uuid4().hex[:6]}
+@synced
 def book(token, provider, slot):
     _check(token, "book", provider); bid = "BK-" + uuid.uuid4().hex[:5]
     BOOKINGS[bid] = dict(provider=provider, slot=slot, active=True); return {"booking_id": bid}
+@synced
 def cancel_booking(bid): BOOKINGS[bid]["active"] = False
 
 # ---- undo-mcp ------------------------------------------------------------------
@@ -95,6 +128,7 @@ def _run(a, tok):
     except Exception as e:
         a["status"] = "failed"; a["error"] = str(e)
 
+@synced
 def undo(aid):
     a = ACTIONS[aid]
     if a["status"] != "done": raise ValueError(f"cannot undo: action is {a['status']}")
@@ -103,6 +137,7 @@ def undo(aid):
     return a
 
 # ---- planner (rule-based stand-in for the LLM) ------------------------------------
+@synced
 def plan(text, requester="Amma"):
     t, out = text.lower(), []
     if re.search(r"send|transfer|ಕಳುಹಿಸ|भेज", t):
@@ -114,10 +149,17 @@ def plan(text, requester="Amma"):
         out.append(request_approval("book", "Dr. Rao", slot="Thursday 11:00", text=text))
     return out
 
+@synced
 def state():
     for aid in list(ACTIONS): _open(aid)
     return {"actions": sorted(ACTIONS.values(), key=lambda a: a["created"]), "ledger": LEDGER}
 
+@synced
 def reset():
     for d in (ACTIONS, TOKENS, BOOKINGS, REVERSE): d.clear()
     LEDGER.clear()
+
+@synced
+def status(aid): return dict(_open(aid))
+@synced
+def ledger_text(): return "\n".join(f"{e['t']} {e['en']}" for e in LEDGER)
