@@ -4,15 +4,11 @@ ElevenLabs calls are checked against a fake urlopen, so no key or network is nee
 import json, sys, urllib.error, urllib.request as u
 import notify, voice
 
-def web(path, body=None, method=None):
-    r = u.Request("http://localhost:8000" + path, json.dumps(body).encode() if body is not None else None,
-                  {"content-type": "application/json"}, method=method)
-    try: return json.load(u.urlopen(r))
-    except urllib.error.HTTPError as e: return {"http": e.code}
+from _http import web
 
 web("/api/reset", {})
-acts = web("/api/ask", {"text": "pay the bill and book my eye checkup Thursday"})
-print("planner via MCP:", [(a["type"], a["amount"] or a["slot"]) for a in acts])
+acts = web("/api/ask", {"text": "pay the bill"})
+print("planner via MCP (amount from Gmail server):", [(a["type"], a["amount"]) for a in acts])
 
 bill = next(a for a in acts if a["type"] == "pay_bill")
 link = notify.link(bill["id"]); path = link.replace("http://localhost:8000", "")

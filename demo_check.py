@@ -1,12 +1,9 @@
 """Headless run of the 3-minute demo script against the running app: ask -> clarifying question -> approve/edit -> run
 -> scam blocked -> undo. Run before every demo:  python demo_check.py   (exit code 0 = demo path is healthy)"""
-import json, sys, threading, time, urllib.request as u
+import sys, threading, time
 from planner import mcp_call
 
-def web(path, body=None):
-    r = u.Request("http://localhost:8000/api/" + path, json.dumps(body if body is not None else {}).encode() if body is not None or path != "state" else None,
-                  {"content-type": "application/json"})
-    return json.load(u.urlopen(r, timeout=150))
+from _http import web
 fails = []
 def check(name, ok, detail=""):
     print(("PASS " if ok else "FAIL ") + name, detail); ok or fails.append(name)

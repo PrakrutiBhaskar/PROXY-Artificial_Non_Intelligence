@@ -14,19 +14,19 @@ input{width:100%;margin:8px 0}button{cursor:pointer;background:#fff}button:focus
 .card.blocked{border-color:var(--bad);background:#fff4f2}.tag{font-size:13px;color:var(--mute)}
 .log div{padding:6px 0;border-bottom:1px solid var(--line)}.log small{color:var(--mute)}.kn{font-size:15px}
 </style></head><body>
-<header><h1>Proxy</h1><button onclick="api('reset')">Reset demo</button></header>
+<header><h1>Proxy</h1><button id="resetbtn" onclick="api('reset')">Reset demo</button></header>
 <main>
-<section><h2>Amma (requester)</h2>
+<section id="sec-req"><h2>Amma (requester)</h2>
 <div class="row"><select id="lang"><option value="en-IN">English</option><option value="kn-IN">ಕನ್ನಡ</option><option value="hi-IN">हिन्दी</option><option value="ta-IN">தமிழ்</option></select>
 <button onclick="listen()" id="mic">Speak</button></div>
 <input id="q" placeholder="Pay the current bill and book my eye checkup Thursday" onkeydown="if(event.key=='Enter')ask()">
 <button class="primary" onclick="ask()">Ask Proxy</button>
 <div id="qbox"></div><h2 style="margin-top:14px">Calendar</h2><div id="cal" class="tag"></div><p class="tag">Try: “Send ₹20,000 to this number, it’s urgent” to see a hard block.</p></section>
-<section><h2>Pooja (approver)</h2><div id="cards"><p class="tag">Nothing waiting for approval.</p></div></section>
+<section id="sec-app"><h2>Pooja (approver)</h2><div id="cards"><p class="tag">Nothing waiting for approval.</p></div></section>
 <section class="wide"><h2>Ledger (read back to Amma by voice)</h2><div class="log" id="log"></div></section>
 </main><script>
-let spoken=0,CQ=null,askedQ=null;function pick(i){api('answer',{id:CQ.id,choice:CQ.options[i]})}const $=id=>document.getElementById(id);
-const api=(p,b)=>fetch('/api/'+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(r=>r.json()).then(refresh);
+let spoken=0,CQ=null,askedQ=null;function pick(i){api('answer',{id:CQ.id,choice:CQ.options[i]})}const $=id=>document.getElementById(id);const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let ACTS={};
+const api=(p,b)=>fetch('/api/'+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(r=>r.status==401?(location.href='/login'):r.json()).then(refresh);
 function ask(){const t=$('q').value.trim();if(t){api('ask',{text:t});$('q').value=''}}
 let CFG={},rec=null;fetch('/api/config').then(r=>r.json()).then(c=>CFG=c);
 async function listen(){
@@ -42,17 +42,18 @@ const Q=[];function say(t,l){Q.push([t,l]);if(Q.length==1)nextSay()}
 function nextSay(){const[t,l]=Q[0],done=()=>{Q.shift();if(Q.length)nextSay()};
 if(CFG.tts){const a=new Audio('/api/tts?text='+encodeURIComponent(t));a.onended=done;a.onerror=done;a.play().catch(done)}
 else{const u=new SpeechSynthesisUtterance(t);u.lang=l;u.onend=done;u.onerror=done;speechSynthesis.speak(u)}}
-function edit(a){const v=prompt(a.type=='book'?'New slot':'New amount (₹)',a.type=='book'?a.slot:a.amount);if(v)api('approve/'+a.id,a.type=='book'?{slot:v}:{amount:+v})}
-async function refresh(){const s=await (await fetch('/api/state')).json();
-CQ=s.question;$('cal').innerHTML=s.events.map(e=>`<div>${new Date(e.date+'T00:00').toLocaleDateString('en-IN',{weekday:'short',day:'numeric',month:'short'})} ${String(e.hour).padStart(2,'0')}:00 — ${e.title}</div>`).join('')||'No events added by Proxy.';$('qbox').innerHTML=CQ?`<div class="card"><b>${CQ.en}</b><div class="kn">${CQ.kn}</div><div class="row" style="margin-top:8px">${CQ.options.map((o,i)=>`<button class="primary" onclick="pick(${i})">${o}</button>`).join('')}</div></div>`:'';
+function edit(id){const a=ACTS[id];const v=prompt(a.type=='book'?'New slot':'New amount (₹)',a.type=='book'?a.slot:a.amount);if(v)api('approve/'+a.id,a.type=='book'?{slot:v}:{amount:+v})}
+async function refresh(){const rs=await fetch('/api/state');if(rs.status==401){location.href='/login';return}const s=await rs.json();ACTS=Object.fromEntries(s.actions.map(a=>[a.id,a]));
+CQ=s.question;$('cal').innerHTML=s.events.map(e=>`<div>${new Date(e.date+'T00:00').toLocaleDateString('en-IN',{weekday:'short',day:'numeric',month:'short'})} ${String(e.hour).padStart(2,'0')}:00 — ${esc(e.title)}</div>`).join('')||'No events added by Proxy.';$('qbox').innerHTML=CQ?`<div class="card"><b>${esc(CQ.en)}</b><div class="kn">${esc(CQ.kn)}</div><div class="row" style="margin-top:8px">${CQ.options.map((o,i)=>`<button class="primary" onclick="pick(${i})">${esc(o)}</button>`).join('')}</div></div>`:'';
 if(CQ&&CQ.id!=askedQ){askedQ=CQ.id;const L=$('lang').value,k=L=='kn-IN';say((k?CQ.kn:CQ.en)+'. '+CQ.options.join('. '),k?'kn-IN':L)}
 const live=s.actions.filter(a=>a.status=='pending'||a.status=='blocked'||a.status=='done');
-$('cards').innerHTML=live.map(a=>a.status=='pending'?`<div class="card"><b>${a.what}</b><div class="tag">${a.type=='pay_bill'?'Account ending 4417. ':''}Token: one use, 30 min.</div>
-<div class="row" style="margin-top:8px"><button class="primary" onclick="api('approve/${a.id}')">Approve</button><button onclick='edit(${JSON.stringify(a)})'>Edit</button><button class="danger" onclick="api('reject/${a.id}')">Reject</button></div></div>`
-:a.status=='blocked'?`<div class="card blocked"><b>Blocked:</b> ${a.what}<div class="tag">Matched a scam rule. Nothing ran.</div></div>`
-:`<div class="card"><b>Done:</b> ${a.what} <button style="float:right" onclick="api('undo/${a.id}')">Undo</button></div>`).join('')||'<p class="tag">Nothing waiting for approval.</p>';
-$('log').innerHTML=s.ledger.slice().reverse().map(e=>`<div>${e.en}<br><span class="kn">${e.kn}</span> <small>${e.t}</small></div>`).join('');
+$('cards').innerHTML=live.map(a=>a.status=='pending'?`<div class="card"><b>${esc(a.what)}</b><div class="tag">${a.type=='pay_bill'?'Account ending 4417. ':''}Token: one use, 30 min.</div>
+<div class="row" style="margin-top:8px"><button class="primary" onclick="api('approve/${a.id}')">Approve</button><button onclick="edit('${a.id}')">Edit</button><button class="danger" onclick="api('reject/${a.id}')">Reject</button></div></div>`
+:a.status=='blocked'?`<div class="card blocked"><b>Blocked:</b> ${esc(a.what)}<div class="tag">Matched a scam rule. Nothing ran.</div></div>`
+:`<div class="card"><b>Done:</b> ${esc(a.what)} <button style="float:right" onclick="api('undo/${a.id}')">Undo</button></div>`).join('')||'<p class="tag">Nothing waiting for approval.</p>';
+$('log').innerHTML=s.ledger.slice().reverse().map(e=>`<div>${esc(e.en)}<br><span class="kn">${esc(e.kn)}</span> <small>${esc(e.t)}</small></div>`).join('');
 if(s.ledger.length<spoken)spoken=0;
 s.ledger.slice(spoken).forEach(e=>{const L=$('lang').value,kn=L=='kn-IN';say(kn?e.kn:e.en,kn?'kn-IN':L=='en-IN'?'en-IN':L)});spoken=s.ledger.length}
+fetch('/api/me').then(r=>r.json()).then(m=>{if(m.role=='approver')$('sec-req').hidden=true;if(m.role=='requester')$('sec-app').hidden=true;$('resetbtn').hidden=!m.reset});
 refresh();setInterval(refresh,2000);
 </script></body></html>

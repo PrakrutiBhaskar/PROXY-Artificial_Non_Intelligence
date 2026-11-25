@@ -58,9 +58,14 @@ def describe(a):
     if a["type"] == "book": return f"book {a['payee']} on {a['slot']}"
     return f"send ₹{a['amount']} to {a['payee']}"
 
+def _clean(s, n):
+    """Free text from the model or a user ends up on screens: drop markup characters and cap the length."""
+    return re.sub(r'[<>"`\\]', "", str(s))[:n]
+
 # ---- consent-mcp -------------------------------------------------------------
 @synced
 def request_approval(type, payee, amount=0, slot="", text="", requester="Amma", approver="Pooja"):
+    payee, slot = _clean(payee, 60), _clean(slot, 30)
     a = dict(id=uuid.uuid4().hex[:6], type=type, payee=payee, amount=amount, slot=slot,
              requester=requester, approver=approver, status="pending", created=time.time())
     a["what"] = describe(a)
@@ -85,7 +90,7 @@ def _open(aid):
 def approve(aid, by="Pooja", slot=None, amount=None):
     a = _open(aid)
     if a["status"] != "pending": raise ValueError(f"action is {a['status']}")
-    if slot: a["slot"] = slot
+    if slot: a["slot"] = _clean(slot, 30)
     if amount is not None: a["amount"] = amount
     a["what"] = describe(a)
     tok = "cap_" + uuid.uuid4().hex[:8]
